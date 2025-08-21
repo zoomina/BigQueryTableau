@@ -1,0 +1,152 @@
+CREATE SCHEMA IF NOT EXISTS `hardy-palace-468300-u5.detail`
+OPTIONS(
+  location="US"
+);
+
+-- UDF
+CREATE TEMP FUNCTION channel_src_final(medium STRING, src STRING, sn STRING)
+RETURNS STRING AS ((
+  WITH host AS (
+    SELECT COALESCE(NULLIF(NET.HOST(src), ''), REGEXP_EXTRACT(src, r'^[a-z0-9]+')) AS h
+  )
+  SELECT CASE
+           WHEN sn IS NULL OR sn IN ('', '(not set)', '(none)', 'not set', 'na', 'none', 'n/a')
+             THEN SPLIT(COALESCE(NET.REG_DOMAIN(h), h), '.')[OFFSET(0)]
+           ELSE sn
+         END
+  FROM host
+));
+
+CREATE TEMP FUNCTION channel_farm_key(medium STRING, src STRING, sn STRING)
+RETURNS INT64 AS (FARM_FINGERPRINT(medium || '|' || channel_src_final(medium, src, sn)));
+
+CREATE TEMP FUNCTION geo_farm_key(country STRING, region STRING)
+RETURNS INT64 AS (FARM_FINGERPRINT(country || '|' || COALESCE(region, '')));
+
+-- session staging
+CREATE TEMP TABLE sales_stage AS
+WITH flatten AS (
+  SELECT s.visitId, s.fullVisitorId, s.visitStartTime, s.date,h.transaction.transactionId, s.geoNetwork.country, s.geoNetwork.region,
+    s.device.operatingSystem, s.device.deviceCategory, s.trafficSource.medium, s.trafficSource.source, h.transaction.transactionRevenue,
+    p.productQuantity, p.productPrice, h.transaction.transactionShipping, h.transaction.transactionTax,
+    h.transaction.transactionCoupon, p.v2ProductCategory, p.v2ProductName,
+    (
+    SELECT LOWER(TRIM(h.social.socialNetwork))
+    FROM UNNEST(s.hits) h
+    WHERE h.social.socialNetwork IS NOT NULL
+    LIMIT 1
+  ) AS sn
+  FROM `bigquery-public-data.google_analytics_sample.ga_sessions_*` s
+  LEFT JOIN UNNEST(s.hits) AS h
+  LEFT JOIN UNNEST(h.product) AS p
+  WHERE _TABLE_SUFFIX BETWEEN '20170501' AND '20170731'
+        AND h.transaction.transactionRevenue IS NOT NULL
+)
+
+SELECT
+  f.visitId, f.fullVisitorId, f.visitStartTime, f.date,
+  CASE WHEN f.country IN ('United States','Canada') THEN f.country ELSE 'Others' END AS region_group,
+  f.country,
+  CASE
+    WHEN f.region IN ('not available in demo dataset', '(not set)') THEN NULL
+    WHEN f.country IN ('United States','Canada') THEN f.region
+    ELSE NULL
+  END AS region,
+  CASE
+    WHEN f.operatingSystem = "(not set)" THEN "others"
+    WHEN f.deviceCategory  = "(not set)" THEN "others"
+    WHEN f.deviceCategory  = "mobile"    THEN f.operatingSystem
+    ELSE f.deviceCategory
+  END AS device,
+  LOWER(TRIM(f.medium)) AS medium,
+  LOWER(TRIM(f.source)) AS src,
+  f.sn, f.transactionId,
+  SAFE_DIVIDE(f.transactionRevenue, 1000000) AS transactionRevenue,
+  SAFE_DIVIDE(f.transactionShipping, 1000000) AS transactionShipping, SAFE_DIVIDE(f.transactionTax, 1000000) AS transactionTax, f.transactionCoupon,
+  f.v2ProductCategory AS productCategory, f.v2ProductName AS productName, f.productQuantity, SAFE_DIVIDE(f.productPrice, 1000000) AS productPrice
+FROM flatten f;
+
+-- channel staging
+CREATE TEMP TABLE channel_stage AS
+SELECT DISTINCT
+  medium, src, sn,
+  channel_src_final(medium, src, sn) AS src_final,
+  channel_farm_key(medium, src, sn)  AS channel_key
+FROM sales_stage;
+
+----------------------------------------------------------------
+-- fact_sales
+-- - grain : transactionId
+-- - partition : date
+-- - Key/Label : transactionId, date, visitId, PK(geo, channel, product)
+-- - Data : quantity, price, tax, shipping, coupon
+----------------------------------------------------------------
+
+CREATE OR REPLACE TABLE `hardy-palace-468300-u5.detail.fact_sales`
+PARTITION BY date
+CLUSTER BY geo_key, channel_key, product_cat_key AS
+SELECT
+  PARSE_DATE('%Y%m%d', s.date) AS date,
+  CONCAT(CAST(s.fullVisitorId AS STRING), '-', CAST(s.visitId AS STRING)) AS session_id,
+  geo_farm_key(s.country, s.region) AS geo_key, c.channel_key AS channel_key,
+  FARM_FINGERPRINT(s.productCategory) AS product_cat_key,
+  s.transactionId, s.transactionRevenue, s.transactionShipping, s.transactionTax, s.transactionCoupon,
+  s.productName, s.productQuantity, s.productPrice
+FROM sales_stage s
+LEFT JOIN channel_stage c
+  ON c.medium = s.medium AND c.src = s.src AND c.sn = s.sn;
+
+----------------------------------------------------------------
+-- meta
+-- - Geo : Country, Region(State), City
+-- - Channel : medium, source
+----------------------------------------------------------------
+
+-- meta_geo
+CREATE TABLE IF NOT EXISTS `hardy-palace-468300-u5.detail.meta_geo` (
+  geo_key INT64, region_group STRING, country STRING, region STRING
+);
+MERGE `hardy-palace-468300-u5.detail.meta_geo` T
+USING (
+  SELECT DISTINCT
+    geo_farm_key(country, region) AS geo_key,
+    region_group, country, region
+  FROM sales_stage
+) S
+ON T.geo_key = S.geo_key
+WHEN NOT MATCHED THEN
+  INSERT (geo_key, region_group, country, region)
+  VALUES (S.geo_key, S.region_group, S.country, S.region);
+
+-- meta_channel
+CREATE TABLE IF NOT EXISTS `hardy-palace-468300-u5.detail.meta_channel` (
+  channel_key INT64, medium STRING, source STRING
+);
+MERGE `hardy-palace-468300-u5.detail.meta_channel` T
+USING (
+  SELECT DISTINCT channel_key, medium, src_final AS source
+  FROM channel_stage
+) S
+ON T.channel_key = S.channel_key
+WHEN NOT MATCHED THEN
+  INSERT (channel_key, medium, source)
+  VALUES (S.channel_key, S.medium, S.source);
+
+-- meta_product_category
+CREATE TABLE IF NOT EXISTS `hardy-palace-468300-u5.detail.meta_product_category` (
+  product_cat_key INT64, category_full STRING, category_1 STRING, category_2 STRING, category_3 STRING
+);
+MERGE `hardy-palace-468300-u5.detail.meta_product_category` T
+USING (
+  SELECT DISTINCT
+    FARM_FINGERPRINT(productCategory) AS product_cat_key,
+    productCategory                   AS category_full,
+    SPLIT(TRIM(productCategory), '/')[SAFE_OFFSET(0)] AS category_1,
+    SPLIT(TRIM(productCategory), '/')[SAFE_OFFSET(1)] AS category_2,
+    SPLIT(TRIM(productCategory), '/')[SAFE_OFFSET(2)] AS category_3
+  FROM sales_stage
+) S
+ON T.product_cat_key = S.product_cat_key
+WHEN NOT MATCHED THEN
+  INSERT (product_cat_key, category_full, category_1, category_2, category_3)
+  VALUES (S.product_cat_key, S.category_full, S.category_1, S.category_2, S.category_3);
