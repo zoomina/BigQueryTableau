@@ -19,3 +19,7 @@
 - Cloud Scheduler 자동화 구성
 - 최종 프로젝트 정리 문서
 
+## Tableau Dashboard
+- Overview
+- Geo Detail (session + revenue)
+- [Product Detail (revenue)](https://public.tableau.com/app/profile/jamin.byeon/viz/bigquery_tableau_detail/1)
