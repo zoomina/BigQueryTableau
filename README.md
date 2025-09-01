@@ -20,6 +20,7 @@
 - 최종 프로젝트 정리 문서
 
 ## Tableau Dashboard
+[Dashboard Link](https://public.tableau.com/views/bigquery_tableau_detail/overview?:language=en-US&:sid=&:redirect=auth&:display_count=n&:origin=viz_share_link)
 - Overview
 - Geo Detail (session + revenue)
-- [Product Detail (revenue)](https://public.tableau.com/app/profile/jamin.byeon/viz/bigquery_tableau_detail/1)
+- Product Detail (revenue)
